@@ -1,0 +1,143 @@
+# Учебный стек: Kafka -> Flink -> Iceberg (Silo, каталог Lakekeeper) + Trino
+# Порты хоста: Kafka 9092 | Flink UI 8081 | Silo (форк MinIO) 9000/9001 | Lakekeeper 8181 | Trino 8080
+services:
+
+  kafka:
+    image: apache/kafka:3.8.0
+    container_name: kafka
+    ports:
+      - "9092:9092"            # для python-скрипта на хосте
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: HOST://:9092,INTERNAL://:29092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: HOST://localhost:9092,INTERNAL://kafka:29092   # INTERNAL: для Flink внутри docker-сети
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: HOST:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_RETENTION_HOURS: 168
+
+  flink-jobmanager:
+    build: ./flink
+    image: iot-flink:1.20
+    container_name: flink-jobmanager
+    command: jobmanager
+    volumes:
+      - ./flink/sql:/opt/flink/sql
+    ports:
+      - "8081:8081"            # Flink Web UI
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.checkpoints.dir: s3://flink/checkpoints
+        s3.endpoint: http://silo:9000
+        s3.path.style.access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+
+  flink-taskmanager:
+    image: iot-flink:1.20
+    container_name: flink-taskmanager
+    command: taskmanager
+    depends_on: [flink-jobmanager]
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        s3.endpoint: http://silo:9000
+        s3.path.style.access: true
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+
+  silo:
+    image: pgsty/silo:latest
+    container_name: silo
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"            # S3 API
+      - "9001:9001"            # веб-консоль
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - silo-data:/data
+
+  silo-init:                   # создаёт бакеты один раз
+    image: pgsty/mc:latest
+    depends_on: [silo]
+    entrypoint: >
+      /bin/sh -c "
+      sleep 5;
+      mc alias set local http://silo:9000 minioadmin minioadmin;
+      mc mb -p local/warehouse local/flink;
+      exit 0;"
+
+  postgres:                    # метаданные Lakekeeper (не данные событий)
+    image: postgres:16
+    container_name: lk-postgres
+    ports:
+      - "5433:5432"            # 5433 на хосте, чтобы не конфликтовать с локальным Postgres
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper -d lakekeeper"]
+      interval: 5s
+      retries: 10
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest-main
+    command: ["migrate"]
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment: &lk-env
+      LAKEKEEPER__PG_ENCRYPTION_KEY: "dev-only-change-me"
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgresql://lakekeeper:lakekeeper@postgres:5432/lakekeeper
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest-main
+    container_name: lakekeeper
+    command: ["serve"]
+    depends_on:
+      lakekeeper-migrate: { condition: service_completed_successfully }
+    ports:
+      - "8181:8181"            # REST-каталог Iceberg + Swagger/UI
+    environment: *lk-env
+
+  trino:
+    image: trinodb/trino:latest
+    container_name: trino
+    depends_on: [lakekeeper]
+    ports:
+      - "8080:8080"            # Trino UI и клиент
+    volumes:
+      - ./trino/catalog:/etc/trino/catalog
+      - ./trino/sql:/sql
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: clickhouse
+    ports:
+      - "8123:8123"            # HTTP
+      - "9009:9000"            # native (9000 on host is taken by Silo)
+    environment:
+      CLICKHOUSE_USER: ch
+      CLICKHOUSE_PASSWORD: ch
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      - ch-data:/var/lib/clickhouse
+    ulimits:
+      nofile: { soft: 262144, hard: 262144 }
+
+volumes:
+  ch-data:
+  silo-data:
+  pg-data:
